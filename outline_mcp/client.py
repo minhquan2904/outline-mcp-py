@@ -1,4 +1,5 @@
 import asyncio
+import re
 import httpx
 from typing import Dict, Any, Optional
 import json
@@ -59,7 +60,7 @@ class Client:
             data = response.json()
             return Result(True, data=data.get("data"), raw=data)
 
-        except asyncio.TimeoutError:
+        except (httpx.TimeoutException, asyncio.TimeoutError):
             msg = f"Request to Outline timed out after {self.timeout_ms}ms on {method}"
             return Result(False, error=self._redact(msg))
         except Exception as e:
@@ -117,35 +118,35 @@ class Client:
         return text.replace(self.api_key, "ol_api_***")
 
 
-def parse_doc_ref(id_or_url: str) -> DocRef:
-    """Parse document reference (URL, UUID, or bare ID)"""
-    id_or_url = id_or_url.strip()
-
-    # UUID format: 550e8400-e29b-41d4-a716-446655440000
-    if len(id_or_url) == 36 and id_or_url.count("-") == 4:
-        return DocRef("uuid", id_or_url)
-
-    # URL format: https://host/doc/title-a1B2c3D4e5
-    if id_or_url.startswith(("http://", "https://")):
-        parts = id_or_url.split("/")
-        if len(parts) > 0:
-            last = parts[-1]
-            if "-" in last:
-                url_id = last.split("-")[-1]
-                if len(url_id) >= 7:
-                    return DocRef("url", url_id)
-        return DocRef("invalid", error="URL format: expected /doc/title-urlId")
-
-    # Bare ID (alphanumeric, at least 7 chars)
-    if len(id_or_url) >= 7 and _is_alphanumeric(id_or_url):
-        return DocRef("id", id_or_url)
-
-    return DocRef("invalid", error="Invalid document reference format")
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+# Measured on a live instance: 9 chars rejected, 10-15 accepted, 16 rejected.
+URLID_RE = re.compile(r"^[A-Za-z0-9]{10,15}$")
+REF_HINT = (
+    "expected a UUID, a 10-15 character urlId, "
+    "or a document URL like /doc/title-a1B2c3D4e5"
+)
 
 
-def _is_alphanumeric(s: str) -> bool:
-    """Check if string is alphanumeric (plus - and _)"""
-    for c in s:
-        if not (c.isalnum() or c in "-_"):
-            return False
-    return True
+def parse_doc_ref(input_ref: str) -> DocRef:
+    """Resolve a pasted UUID, urlId or document URL to an id documents.info accepts."""
+    s = input_ref.strip() if isinstance(input_ref, str) else ""
+    if not s:
+        return DocRef("invalid", error=f"Empty document reference — {REF_HINT}.")
+    if UUID_RE.match(s):
+        return DocRef("uuid", s)
+
+    segment = s
+    idx = s.find("/doc/")
+    if idx != -1:
+        segment = s[idx + len("/doc/"):].split("/")[0]  # drop sub-paths such as /edit
+    elif re.match(r"(?i)^https?://", s) or s.startswith("/"):
+        return DocRef("invalid", error=f'"{s}" is not a document URL — {REF_HINT}.')
+
+    segment = re.split(r"[?#]", segment)[0].rstrip("/")
+    if not segment:
+        return DocRef("invalid", error=f'"{s}" has no document id — {REF_HINT}.')
+
+    candidate = segment.rsplit("-", 1)[-1]
+    if URLID_RE.match(candidate):
+        return DocRef("urlId", candidate)
+    return DocRef("invalid", error=f'"{s}" is not a document reference — {REF_HINT}.')

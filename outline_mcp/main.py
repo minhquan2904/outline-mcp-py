@@ -1,6 +1,8 @@
+import asyncio
 import os
 import sys
-import asyncio
+
+from mcp import types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
@@ -9,40 +11,31 @@ from .tools import TOOLS
 
 
 async def main():
-    base_url = os.getenv("OUTLINE_API_URL", "")
-    api_key = os.getenv("OUTLINE_API_KEY", "")
+    client = Client(os.getenv("OUTLINE_API_URL", ""), os.getenv("OUTLINE_API_KEY", ""))
+    tools = {t["name"]: t for t in TOOLS}
+    server = Server("outline-mcp-py")
 
-    client = Client(base_url, api_key)
+    @server.list_tools()
+    async def list_tools():
+        return [
+            types.Tool(name=t["name"], description=t["description"], inputSchema=t["schema"])
+            for t in TOOLS
+        ]
 
-    # Create MCP server
-    server = Server("outline")
+    @server.call_tool()
+    async def call_tool(name: str, arguments: dict):
+        tool = tools.get(name)
+        if tool is None:
+            raise ValueError(f"Unknown tool: {name}")
+        output = await tool["handler"](arguments or {}, client)
+        return [types.TextContent(type="text", text=output)]
 
-    # Register tools
-    for tool_def in TOOLS:
-        tool_name = tool_def["name"]
-        tool_desc = tool_def["description"]
-        handler = tool_def["handler"]
-
-        @server.call_tool()
-        async def call_tool(name: str = tool_name, args=None, handler=handler, client=client):
-            """Handle tool call"""
-            if args is None:
-                args = {}
-
-            # Execute handler
-            output = await handler(args, client)
-
-            # Determine if error
-            is_error = output.startswith("Error:")
-
-            return {
-                "content": [{"type": "text", "text": output}],
-                "isError": is_error,
-            }
-
-    # Run server with stdio transport
-    async with stdio_server(server) as server_handle:
-        await server_handle.wait_closed()
+    print("[outline] MCP server started (stdio transport)", file=sys.stderr, flush=True)
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, server.create_initialization_options())
+    finally:
+        await client.http.aclose()
 
 
 def run():
